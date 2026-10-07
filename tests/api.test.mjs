@@ -1,0 +1,28 @@
+import {DatabaseSync} from 'node:sqlite';
+import {build} from 'esbuild';
+import {readFile} from 'node:fs/promises';
+import assert from 'node:assert/strict';
+const sql=new DatabaseSync(':memory:');
+sql.exec(await readFile('drizzle/0000_nebulous_pete_wisdom.sql','utf8'));
+const wrap=(query,args=[])=>({bind:(...values)=>wrap(query,values),first:async()=>sql.prepare(query).get(...args)||null,run:async()=>({meta:{changes:Number(sql.prepare(query).run(...args).changes)}})});
+globalThis.__GAME_DB={prepare:query=>wrap(query),batch:async(stmts)=>{sql.exec('BEGIN');try{const result=[];for(const s of stmts)result.push(await s.run());sql.exec('COMMIT');return result}catch(e){sql.exec('ROLLBACK');throw e}}};
+const b=await build({entryPoints:['app/api/game/route.ts'],bundle:true,platform:'node',format:'esm',write:false,plugins:[{name:'real-sqlite-d1-adapter',setup(build){build.onResolve({filter:/^cloudflare:workers$/},()=>({path:'db',namespace:'test'}));build.onLoad({filter:/.*/,namespace:'test'},()=>({contents:'export const env={DB:globalThis.__GAME_DB}',loader:'js'}))}}]});
+const api=await import('data:text/javascript;base64,'+Buffer.from(b.outputFiles[0].text).toString('base64'));
+async function call(cookie,body){const req=new Request('https://game.test/api/game',{method:'POST',headers:{'Content-Type':'application/json',Origin:'https://game.test',...(cookie?{Cookie:cookie}:{})},body:JSON.stringify({...body,actionId:body.actionId||crypto.randomUUID()})});const r=await api.POST(req);return{status:r.status,data:await r.json(),cookie:r.headers.get('set-cookie')?.split(';')[0]||cookie}}
+const a=await call(null,{type:'create',leader:'weaver',domain:'brain',name:'甲',solo:false});assert.equal(a.status,200);assert(a.cookie?.startsWith('era_session='));const code=a.data.game.code;
+const bJoin=await call(null,{type:'join',code,leader:'sam',domain:'vision',name:'乙'});assert.equal(bJoin.status,200);assert.equal(bJoin.data.game.players.length,2);assert.equal(bJoin.data.game.host,'other');
+const intrude=await call(null,{type:'join',code:'NOTAROOM',leader:'sam',domain:'vision'});assert.equal(intrude.status,400);
+const denied=await call(bJoin.cookie,{type:'start'});assert.equal(denied.status,400);
+let start=await call(a.cookie,{type:'start'});assert.equal(start.status,200);assert.equal(start.data.game.round,1);assert.equal(start.data.game.players.length,8);
+const buy={type:'buy',index:0,expectedRound:1,expectedPhase:'shop',actionId:'same-buy-001'};
+const first=await call(a.cookie,buy);assert.equal(first.status,200);const second=await call(a.cookie,buy);assert.equal(second.status,200);assert.equal(second.data.game.me.gold,first.data.game.me.gold);
+const before=first.data.game.me.gold;const double=await Promise.all([call(a.cookie,{type:'xp',actionId:'xp1'}),call(a.cookie,{type:'xp',actionId:'xp2'})]);assert(double.every(r=>r.status===200));
+const after=await api.GET(new Request('https://game.test/api/game',{headers:{Cookie:a.cookie}}));const resumed=await after.json();assert.equal(resumed.game.me.gold,before-4);assert.equal(resumed.game.me.xp,4);assert.equal(resumed.game.code,code);
+const leak=JSON.stringify(resumed.game);assert(!leak.includes(bJoin.cookie.split('=')[1]));assert(!leak.includes(a.cookie.split('=')[1]));
+await call(a.cookie,{type:'ready'});const round=await call(bJoin.cookie,{type:'ready'});assert.equal(round.data.game.phase,'battle');assert(round.data.game.me.detail.dims.every(n=>Number.isFinite(n)));
+const stale=await call(a.cookie,{type:'buy',index:1,expectedRound:1,expectedPhase:'shop'});assert.equal(stale.status,400);assert.match(stale.data.error,/阶段/);
+const csrf=await api.POST(new Request('https://game.test/api/game',{method:'POST',headers:{Origin:'https://evil.test'},body:'{}'}));assert.equal(csrf.status,403);
+await call(a.cookie,{type:'leave'});const left=await api.GET(new Request('https://game.test/api/game',{headers:{Cookie:a.cookie}}));assert.equal((await left.json()).game,null);const rejoin=await call(a.cookie,{type:'join',code,leader:'weaver',domain:'brain',name:'甲'});assert.equal(rejoin.status,200);assert.equal(rejoin.data.game.phase,'battle');
+const anon=await api.GET(new Request('https://game.test/api/game'));assert.equal((await anon.json()).game,null);
+console.log('API integration passed: SQLite persistence, 2-player join/start/ready, resume, idempotency, concurrent updates, privacy, stale-action guard, CSRF, leave/rejoin.');
+sql.close();
